@@ -65,9 +65,11 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write  # Required for Sonatype Guide OIDC authentication
+  contents: read
+
+env:
+  AGP_API_URL: ${{ vars.AGP_API_URL || 'http://127.0.0.1:8070/api/agp' }}
+  AGP_OIDC_AUDIENCE: ${{ vars.AGP_OIDC_AUDIENCE || 'http://127.0.0.1:8070' }}
 
 concurrency:
   group: agp-workflow
@@ -77,51 +79,90 @@ jobs:
   # Cheap, Docker-free gate. Determines whether AGP should run for this repo and, when
   # it should, writes the governed effective agp.yml to the workspace (fail-closed).
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.AGP_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       directive: ${{ steps.gate.outputs.directive }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check Lifecycle connectivity configuration
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          from urllib.parse import urlparse
+          address = urlparse(os.environ['AGP_API_URL'])
+          if os.environ['RUNNER_ENVIRONMENT'] == 'github-hosted' and address.hostname in {'127.0.0.1', 'localhost', '::1'}:
+              raise SystemExit('::error::GitHub-hosted runners cannot reach Lifecycle on your Mac through loopback. Configure a reachable AGP_API_URL or an approved self-hosted runner; see .github/agent-p/README.md.')
+          PYTHON
       - name: Sonatype Guide gate
         id: gate
-        uses: sonatype/agp-action/gate@v1
+        uses: sonatype/agp-action/gate@204590723e731baef51c5467e7f6a1afeb1e12c6 # v1
         with:
-          guide-url: ${{ vars.AGP_API_URL || 'http://127.0.0.1:8070/api/agp' }}
-          audience: http://127.0.0.1:8070
+          guide-url: ${{ env.AGP_API_URL }}
+          audience: ${{ env.AGP_OIDC_AUDIENCE }}
 
   agp:
     needs: gate
     if: needs.gate.outputs.directive == 'run'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.AGP_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    env:
+      AGP_LOCAL_IMAGE: webgoat-agent-p-java8:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Fetch governed configuration
         # GitHub jobs run separately and don't share files, so fetch the governed configuration
         # again here for the AGP run below to use. The gate also marks the file it writes
         # git-excluded for this checkout only, so it is never reported as an uncommitted change —
         # no extra git command is needed here.
-        uses: sonatype/agp-action/gate@v1
+        uses: sonatype/agp-action/gate@204590723e731baef51c5467e7f6a1afeb1e12c6 # v1
         with:
-          guide-url: ${{ vars.AGP_API_URL || 'http://127.0.0.1:8070/api/agp' }}
-          audience: http://127.0.0.1:8070
+          guide-url: ${{ env.AGP_API_URL }}
+          audience: ${{ env.AGP_OIDC_AUDIENCE }}
+
+      - name: Build Java 8 runtime locally
+        shell: bash
+        run: docker build --tag "$AGP_LOCAL_IMAGE" --file .github/agent-p/Dockerfile .github/agent-p
 
       - name: Run AGP
-        uses: sonatype/agp-action@v1
+        uses: sonatype/agp-action@204590723e731baef51c5467e7f6a1afeb1e12c6 # v1
         with:
           # Forward the dispatch inputs so a backend-triggered run targets the right mode.
           # A full/scheduled run sends mode=full; security-fix sends mode=security
           # with a vulnerabilities payload; heal sends mode=heal with repo_id; and
           # resolve-failure sends mode=resolve-failure with repo_id when CI fails on an
           # open Agent P pull request.
+          docker-image: ${{ env.AGP_LOCAL_IMAGE }}
+          skip-docker-pull: true
           mode: ${{ inputs.mode || 'full' }}
           repo_id: ${{ inputs.repo_id || '' }}
           vulnerabilities: ${{ inputs.vulnerabilities }}
           verbose: ${{ inputs.verbose || 'false' }}
-          audience: http://127.0.0.1:8070
+          audience: ${{ env.AGP_OIDC_AUDIENCE }}
         env:
-          AGP_API_URL: ${{ vars.AGP_API_URL || 'http://127.0.0.1:8070/api/agp' }}
+          AGP_API_URL: ${{ env.AGP_API_URL }}
+
+      - name: Remove temporary runtime image
+        if: always()
+        shell: bash
+        run: |
+          if docker image inspect "$AGP_LOCAL_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$AGP_LOCAL_IMAGE"
+          fi
